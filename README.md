@@ -1,25 +1,20 @@
 # Flask App Manager
 
-A simple CLI tool to manage multiple Flask apps on one Ubuntu server.
+Lightweight CLI to manage multiple Flask apps on one server.
 
-It can:
+## Features
 
-- List apps
-- Check systemd status
-- Start / stop / restart apps
-- Show recent logs
-- Add app config
-- Generate systemd service files
-- Generate Nginx config files
-- Check ports
-- Show basic app information
+- Manage apps (start/stop/restart)
+- Monitor (status, CPU, RAM)
+- Auto restart (self-healing)
+- Deploy (git + pip + restart)
+- Backup
+- Create apps automatically
+- SSL (Certbot)
+- Cloudflare support
+- Simple web dashboard
 
-Recommended stack:
-
-```text
-Nginx → Gunicorn → Flask app
-systemd keeps each app alive
-```
+---
 
 ## Install
 
@@ -32,53 +27,61 @@ cd flask-app-manager
 bash install.sh
 ```
 
-## Add app
+---
+
+## Quick start
+
+Create app:
 
 ```bash
-sudo fmanager add app1 \
-  --path /apps/app1 \
-  --domain app1.example.com \
-  --port 8001 \
-  --module app:app
+sudo fmanager create app1 --domain app1.com
 ```
 
-## Generate systemd service
+Start it:
 
 ```bash
 sudo fmanager gen-systemd app1
 sudo systemctl daemon-reload
-sudo systemctl enable app1
-sudo systemctl start app1
-```
+sudo systemctl enable --now app1
 
-## Generate Nginx config
-
-```bash
 sudo fmanager gen-nginx app1
-sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-## Commands
+---
+
+## Useful commands
 
 ```bash
 fmanager list
 fmanager status
-fmanager status app1
-fmanager start app1
-fmanager stop app1
-fmanager restart app1
+fmanager top
 fmanager logs app1
-fmanager logs app1 --lines 100
-fmanager logs app1 -f
-fmanager ports
-fmanager info app1
-fmanager check app1
+fmanager deploy app1
+fmanager backup app1
+fmanager doctor
 ```
 
-## SSL with Certbot
+---
+
+## Auto restart
 
 ```bash
-sudo apt install certbot python3-certbot-nginx -y
-sudo certbot --nginx -d app1.example.com
+sudo fmanager autorestart
 ```
+
+---
+
+## Web dashboard
+
+```bash
+fmanager web --port 5050 --password 1234
+```
+
+---
+
+## Notes
+
+- Designed to be simple (no Docker, no panels)
+- Works with systemd + nginx + gunicorn
+- Extendable but minimal by default
