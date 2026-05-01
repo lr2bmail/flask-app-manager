@@ -1,5 +1,6 @@
 # Flask App Manager
 
+![Tests](https://github.com/lr2bmail/flask-app-manager/actions/workflows/tests.yml/badge.svg)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![Ubuntu](https://img.shields.io/badge/Ubuntu-20.04%2B-orange)
 ![Nginx](https://img.shields.io/badge/Nginx-supported-brightgreen)
@@ -144,20 +145,6 @@ fmanager doctor
 sudo fmanager deploy app1
 ```
 
-This runs:
-
-```text
-git pull
-pip install -r requirements.txt
-systemctl restart app1
-```
-
-Skip restart:
-
-```bash
-sudo fmanager deploy app1 --no-restart
-```
-
 ---
 
 ## Backup
@@ -166,95 +153,20 @@ sudo fmanager deploy app1 --no-restart
 sudo fmanager backup app1
 ```
 
-Backups are stored in:
-
-```text
-/var/backups/fmanager/
-```
-
 ---
 
 ## Auto restart / self-healing
 
-Enable automatic health checks:
-
 ```bash
 sudo fmanager autorestart
-```
-
-Default interval is every 1 minute.
-
-Custom interval:
-
-```bash
-sudo fmanager autorestart --minutes 2
-```
-
-Check timer:
-
-```bash
-systemctl status fmanager-doctor.timer
-```
-
-Manual health check:
-
-```bash
-fmanager doctor
-```
-
-Manual health check with restart fix:
-
-```bash
-sudo fmanager doctor --fix
 ```
 
 ---
 
 ## Web dashboard
 
-Run locally:
-
 ```bash
 fmanager web --port 5050 --password strong-password
-```
-
-Open:
-
-```text
-http://127.0.0.1:5050
-```
-
-For public access, prefer SSH tunnel or put it behind a firewall.
-
----
-
-## Cloudflare
-
-Show guide:
-
-```bash
-fmanager cloudflare info
-```
-
-Create Nginx real-IP snippet:
-
-```bash
-sudo fmanager cloudflare snippet
-```
-
-Enable Cloudflare mode for an app:
-
-```bash
-sudo fmanager cloudflare enable app1
-sudo fmanager gen-nginx app1 --force
-sudo nginx -t
-sudo systemctl reload nginx
-```
-
-Recommended Cloudflare SSL mode:
-
-```text
-Full or Full (strict)
 ```
 
 ---
@@ -263,5 +175,3 @@ Full or Full (strict)
 
 - Designed to be simple: no Docker, no Kubernetes, no hosting panel
 - Works with systemd + Nginx + Gunicorn
-- Best for small/medium Flask apps, APIs, dashboards, internal tools
-- Keep `/etc/fmanager/apps.yml` backed up
