@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 import argparse
+import base64
+import html
 import os
+import shutil
 import subprocess
 import sys
+import tarfile
+import time
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import psutil
@@ -12,11 +19,12 @@ CONFIG_PATH = Path('/etc/fmanager/apps.yml')
 SYSTEMD_PATH = Path('/etc/systemd/system')
 NGINX_AVAILABLE = Path('/etc/nginx/sites-available')
 NGINX_ENABLED = Path('/etc/nginx/sites-enabled')
+BACKUP_DIR = Path('/var/backups/fmanager')
 
 
-def run_cmd(cmd, check=False):
+def run_cmd(cmd, cwd=None, check=False):
     try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
+        result = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
         return result.returncode, result.stdout.strip(), result.stderr.strip()
     except FileNotFoundError:
         return 127, '', f'Command not found: {cmd[0]}'
@@ -78,12 +86,12 @@ def get_port_process(port):
         port = int(port)
     except Exception:
         return None
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'cpu_percent', 'memory_info']):
         try:
             for conn in proc.net_connections(kind='inet'):
                 if conn.laddr and conn.laddr.port == port and conn.status == psutil.CONN_LISTEN:
                     cmdline = ' '.join(proc.info.get('cmdline') or [])
-                    return proc.info['pid'], proc.info['name'], cmdline
+                    return proc.info['pid'], proc.info['name'], cmdline, proc
         except Exception:
             continue
     return None
@@ -101,13 +109,31 @@ def print_table(rows, headers):
         print('  '.join(str(value).ljust(widths[i]) for i, value in enumerate(row)))
 
 
-def cmd_list(args):
-    apps = load_config().get('apps', {})
+def app_rows(include_usage=False):
     rows = []
-    for name, app in apps.items():
+    for name, app in load_config().get('apps', {}).items():
         service = app.get('service', name)
         port = app.get('port', '-')
-        rows.append([name, systemctl_status(service), service_enabled(service), port, 'open' if port_open(port) else 'closed', app.get('domain', '-')])
+        proc_data = get_port_process(port)
+        base = [name, systemctl_status(service), service_enabled(service), port, 'open' if port_open(port) else 'closed', app.get('domain', '-')]
+        if include_usage:
+            cpu = '-'
+            ram = '-'
+            pid = '-'
+            if proc_data:
+                pid, _, _, proc = proc_data
+                try:
+                    cpu = f'{proc.cpu_percent(interval=0.1):.1f}%'
+                    ram = f'{proc.memory_info().rss / 1024 / 1024:.1f}MB'
+                except Exception:
+                    pass
+            base += [pid, cpu, ram]
+        rows.append(base)
+    return rows
+
+
+def cmd_list(args):
+    rows = app_rows(False)
     if not rows:
         print('No apps configured.')
         return
@@ -124,6 +150,14 @@ def cmd_status(args):
         proc = get_port_process(port)
         rows.append([name, systemctl_status(service), service_enabled(service), port, 'open' if port_open(port) else 'closed', proc[0] if proc else '-', proc[1] if proc else '-'])
     print_table(rows, ['APP', 'STATUS', 'ENABLED', 'PORT', 'PORT STATUS', 'PID', 'PROCESS'])
+
+
+def cmd_top(args):
+    rows = app_rows(True)
+    if not rows:
+        print('No apps configured.')
+        return
+    print_table(rows, ['APP', 'STATUS', 'ENABLED', 'PORT', 'PORT STATUS', 'DOMAIN', 'PID', 'CPU', 'RAM'])
 
 
 def cmd_service(args, action):
@@ -251,12 +285,99 @@ def cmd_check(args):
     print_table([[n, 'OK' if ok else 'NO', d] for n, ok, d in checks], ['CHECK', 'STATUS', 'DETAIL'])
 
 
+def cmd_deploy(args):
+    require_root_for_write()
+    app = get_app(args.name)
+    path = Path(app['path'])
+    service = app.get('service', args.name)
+    venv = Path(app.get('venv', path / 'venv'))
+    req = path / 'requirements.txt'
+
+    if not path.exists():
+        print(f'App path not found: {path}')
+        sys.exit(1)
+
+    if (path / '.git').exists():
+        print('Pulling latest code...')
+        print(run_cmd(['git', 'pull'], cwd=str(path))[1])
+    else:
+        print('No .git folder found, skipping git pull.')
+
+    if req.exists() and (venv / 'bin/pip').exists():
+        print('Installing requirements...')
+        code, out, err = run_cmd([str(venv / 'bin/pip'), 'install', '-r', str(req)], cwd=str(path))
+        print(out or err)
+    else:
+        print('No requirements.txt or venv pip found, skipping pip install.')
+
+    if not args.no_restart:
+        print('Restarting service...')
+        code, out, err = run_cmd(['systemctl', 'restart', service])
+        print(out or err or f'Restarted {service}')
+
+
+def cmd_backup(args):
+    require_root_for_write()
+    app = get_app(args.name)
+    path = Path(app['path'])
+    if not path.exists():
+        print(f'App path not found: {path}')
+        sys.exit(1)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    target = BACKUP_DIR / f'{args.name}_{stamp}.tar.gz'
+    exclude = {'venv', '__pycache__', '.git', 'node_modules'}
+    with tarfile.open(target, 'w:gz') as tar:
+        for item in path.rglob('*'):
+            if any(part in exclude for part in item.relative_to(path).parts):
+                continue
+            tar.add(item, arcname=f'{args.name}/{item.relative_to(path)}')
+    print(f'Backup created: {target}')
+
+
+def render_dashboard():
+    rows = app_rows(True)
+    trs = ''
+    for r in rows:
+        trs += '<tr>' + ''.join(f'<td>{html.escape(str(x))}</td>' for x in r) + '</tr>'
+    return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="10"><title>Flask App Manager</title><style>body{{font-family:Arial;margin:24px;background:#f6f7fb}}table{{border-collapse:collapse;width:100%;background:white}}td,th{{padding:10px;border-bottom:1px solid #ddd;text-align:left}}.card{{background:white;padding:18px;border-radius:12px;box-shadow:0 2px 10px #0001}}code{{background:#eee;padding:2px 5px;border-radius:4px}}</style></head><body><div class="card"><h1>Flask App Manager</h1><p>Auto refresh every 10 seconds. Actions are CLI-only for safety.</p><table><thead><tr><th>APP</th><th>STATUS</th><th>ENABLED</th><th>PORT</th><th>PORT STATUS</th><th>DOMAIN</th><th>PID</th><th>CPU</th><th>RAM</th></tr></thead><tbody>{trs}</tbody></table><p>Use <code>fmanager restart appname</code>, <code>fmanager logs appname</code>, or <code>fmanager deploy appname</code> from SSH.</p></div></body></html>'''
+
+
+def cmd_web(args):
+    user = args.user or os.environ.get('FMANAGER_USER', 'admin')
+    password = args.password or os.environ.get('FMANAGER_PASS')
+    if not password:
+        print('Set password with --password or FMANAGER_PASS env var.')
+        sys.exit(1)
+    token = 'Basic ' + base64.b64encode(f'{user}:{password}'.encode()).decode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.headers.get('Authorization') != token:
+                self.send_response(401)
+                self.send_header('WWW-Authenticate', 'Basic realm="fmanager"')
+                self.end_headers()
+                self.wfile.write(b'Auth required')
+                return
+            body = render_dashboard().encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f'Web dashboard: http://{args.host}:{args.port}  user={user}')
+    server.serve_forever()
+
+
 def main():
     parser = argparse.ArgumentParser(prog='fmanager', description='Manage multiple Flask apps on one Ubuntu server')
     sub = parser.add_subparsers(dest='command')
 
     p = sub.add_parser('list', help='List configured apps'); p.set_defaults(func=cmd_list)
     p = sub.add_parser('status', help='Show app status'); p.add_argument('name', nargs='?'); p.set_defaults(func=cmd_status)
+    p = sub.add_parser('top', help='Show CPU/RAM per configured app'); p.set_defaults(func=cmd_top)
     p = sub.add_parser('start', help='Start app'); p.add_argument('name'); p.set_defaults(func=lambda a: cmd_service(a, 'start'))
     p = sub.add_parser('stop', help='Stop app'); p.add_argument('name'); p.set_defaults(func=lambda a: cmd_service(a, 'stop'))
     p = sub.add_parser('restart', help='Restart app'); p.add_argument('name'); p.set_defaults(func=lambda a: cmd_service(a, 'restart'))
@@ -268,6 +389,9 @@ def main():
     p = sub.add_parser('gen-systemd', help='Generate systemd service'); p.add_argument('name'); p.add_argument('--force', action='store_true'); p.set_defaults(func=cmd_gen_systemd)
     p = sub.add_parser('gen-nginx', help='Generate Nginx config'); p.add_argument('name'); p.add_argument('--force', action='store_true'); p.set_defaults(func=cmd_gen_nginx)
     p = sub.add_parser('check', help='Check app files and port'); p.add_argument('name'); p.set_defaults(func=cmd_check)
+    p = sub.add_parser('deploy', help='git pull, pip install, restart'); p.add_argument('name'); p.add_argument('--no-restart', action='store_true'); p.set_defaults(func=cmd_deploy)
+    p = sub.add_parser('backup', help='Create tar.gz backup of app files'); p.add_argument('name'); p.set_defaults(func=cmd_backup)
+    p = sub.add_parser('web', help='Run simple web dashboard'); p.add_argument('--host', default='127.0.0.1'); p.add_argument('--port', type=int, default=5050); p.add_argument('--user', default='admin'); p.add_argument('--password'); p.set_defaults(func=cmd_web)
 
     args = parser.parse_args()
     if not args.command:
