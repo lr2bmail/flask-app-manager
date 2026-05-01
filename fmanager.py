@@ -3,11 +3,9 @@ import argparse
 import base64
 import html
 import os
-import shutil
 import subprocess
 import sys
 import tarfile
-import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,6 +18,7 @@ SYSTEMD_PATH = Path('/etc/systemd/system')
 NGINX_AVAILABLE = Path('/etc/nginx/sites-available')
 NGINX_ENABLED = Path('/etc/nginx/sites-enabled')
 BACKUP_DIR = Path('/var/backups/fmanager')
+CLOUDFLARE_NGINX_SNIPPET = Path('/etc/nginx/snippets/cloudflare-real-ip.conf')
 
 
 def run_cmd(cmd, cwd=None, check=False):
@@ -95,6 +94,14 @@ def get_port_process(port):
         except Exception:
             continue
     return None
+
+
+def next_free_port(start=8001):
+    port = start
+    used = {int(a.get('port')) for a in load_config().get('apps', {}).values() if str(a.get('port', '')).isdigit()}
+    while port in used or port_open(port):
+        port += 1
+    return port
 
 
 def print_table(rows, headers):
@@ -191,25 +198,49 @@ def cmd_info(args):
         print(f'{key}: {value}')
 
 
-def cmd_add(args):
+def add_app_config(name, path, domain, port, module='app:app', service=None, user='www-data', workers=3, venv=None, env_file=None, description=''):
     data = load_config()
-    if args.name in data.get('apps', {}):
-        print(f'App already exists: {args.name}')
+    if name in data.get('apps', {}):
+        print(f'App already exists: {name}')
         sys.exit(1)
-    data['apps'][args.name] = {
-        'path': args.path,
-        'domain': args.domain,
-        'port': args.port,
-        'module': args.module,
-        'service': args.service or args.name,
-        'user': args.user,
-        'workers': args.workers,
-        'venv': args.venv or f'{args.path}/venv',
-        'env_file': args.env_file or f'{args.path}/.env',
-        'description': args.description or '',
+    data['apps'][name] = {
+        'path': path,
+        'domain': domain,
+        'port': port,
+        'module': module,
+        'service': service or name,
+        'user': user,
+        'workers': workers,
+        'venv': venv or f'{path}/venv',
+        'env_file': env_file or f'{path}/.env',
+        'description': description or '',
     }
     save_config(data)
+
+
+def cmd_add(args):
+    add_app_config(args.name, args.path, args.domain, args.port, args.module, args.service, args.user, args.workers, args.venv, args.env_file, args.description)
     print(f'Added app: {args.name}')
+
+
+def cmd_create(args):
+    require_root_for_write()
+    path = Path(args.path or f'/apps/{args.name}')
+    port = args.port or next_free_port()
+    if path.exists() and any(path.iterdir()) and not args.force:
+        print(f'Path exists and is not empty: {path}. Use --force to continue.')
+        sys.exit(1)
+    path.mkdir(parents=True, exist_ok=True)
+    (path / 'app.py').write_text("from flask import Flask\n\napp = Flask(__name__)\n\n@app.route('/')\ndef home():\n    return 'Hello from %s'\n\n@app.route('/health')\ndef health():\n    return {'status': 'ok'}\n" % args.name)
+    (path / 'requirements.txt').write_text('Flask==3.0.3\ngunicorn==22.0.0\n')
+    (path / '.env').write_text('FLASK_ENV=production\nSECRET_KEY=change-me\n')
+    run_cmd(['python3', '-m', 'venv', str(path / 'venv')])
+    run_cmd([str(path / 'venv/bin/pip'), 'install', '-r', str(path / 'requirements.txt')])
+    add_app_config(args.name, str(path), args.domain, port, 'app:app', args.service or args.name, args.user, args.workers, str(path / 'venv'), str(path / '.env'), args.description or f'{args.name} Flask app')
+    print(f'Created Flask app: {path}')
+    print(f'Added config: {args.name} on port {port}')
+    print(f'Next: sudo fmanager gen-systemd {args.name} && sudo systemctl daemon-reload && sudo systemctl enable --now {args.name}')
+    print(f'Then: sudo fmanager gen-nginx {args.name} && sudo nginx -t && sudo systemctl reload nginx')
 
 
 def cmd_remove(args):
@@ -249,7 +280,10 @@ def cmd_gen_systemd(args):
 
 
 def build_nginx_config(name, app):
-    return f'''server {{\n    listen 80;\n    server_name {app['domain']};\n\n    client_max_body_size 50M;\n\n    location / {{\n        proxy_pass http://127.0.0.1:{app['port']};\n        proxy_http_version 1.1;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_connect_timeout 60s;\n        proxy_send_timeout 60s;\n        proxy_read_timeout 60s;\n    }}\n\n    location /static/ {{\n        alias {app['path']}/static/;\n        expires 7d;\n    }}\n}}\n'''
+    cf_include = ''
+    if app.get('cloudflare'):
+        cf_include = '    include /etc/nginx/snippets/cloudflare-real-ip.conf;\n'
+    return f'''server {{\n    listen 80;\n    server_name {app['domain']};\n{cf_include}\n    client_max_body_size 50M;\n\n    location / {{\n        proxy_pass http://127.0.0.1:{app['port']};\n        proxy_http_version 1.1;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_connect_timeout 60s;\n        proxy_send_timeout 60s;\n        proxy_read_timeout 60s;\n    }}\n\n    location /static/ {{\n        alias {app['path']}/static/;\n        expires 7d;\n    }}\n}}\n'''
 
 
 def cmd_gen_nginx(args):
@@ -267,6 +301,48 @@ def cmd_gen_nginx(args):
     print(f'Created: {target}')
     print(f'Enabled: {link}')
     print('Run: sudo nginx -t && sudo systemctl reload nginx')
+
+
+def cmd_ssl(args):
+    require_root_for_write()
+    app = get_app(args.name)
+    domain = app.get('domain')
+    run_cmd(['apt', 'install', 'certbot', 'python3-certbot-nginx', '-y'])
+    cmd = ['certbot', '--nginx', '-d', domain]
+    if args.email:
+        cmd += ['--email', args.email, '--agree-tos', '--no-eff-email']
+    else:
+        cmd += ['--register-unsafely-without-email']
+    if args.redirect:
+        cmd += ['--redirect']
+    subprocess.run(cmd)
+
+
+def cmd_cloudflare(args):
+    data = load_config()
+    if args.action == 'enable':
+        require_root_for_write()
+        app = data.get('apps', {}).get(args.name)
+        if not app:
+            print(f'App not found: {args.name}')
+            sys.exit(1)
+        app['cloudflare'] = True
+        save_config(data)
+        print(f'Cloudflare mode enabled for {args.name}. Regenerate nginx: sudo fmanager gen-nginx {args.name} --force')
+    elif args.action == 'snippet':
+        require_root_for_write()
+        CLOUDFLARE_NGINX_SNIPPET.parent.mkdir(parents=True, exist_ok=True)
+        CLOUDFLARE_NGINX_SNIPPET.write_text(CLOUDFLARE_SNIPPET)
+        print(f'Created: {CLOUDFLARE_NGINX_SNIPPET}')
+        print('Run: sudo nginx -t && sudo systemctl reload nginx')
+    elif args.action == 'info':
+        print('Cloudflare support in fmanager is simple by design:')
+        print('1) Create DNS A record in Cloudflare: app domain -> your server IP')
+        print('2) Use SSL/TLS mode: Full or Full (strict)')
+        print('3) Run: sudo fmanager cloudflare snippet')
+        print('4) Run: sudo fmanager cloudflare enable APP')
+        print('5) Regenerate nginx: sudo fmanager gen-nginx APP --force')
+        print('Note: API DNS automation can be added later, but this keeps tokens out of the tool.')
 
 
 def cmd_check(args):
@@ -292,24 +368,20 @@ def cmd_deploy(args):
     service = app.get('service', args.name)
     venv = Path(app.get('venv', path / 'venv'))
     req = path / 'requirements.txt'
-
     if not path.exists():
         print(f'App path not found: {path}')
         sys.exit(1)
-
     if (path / '.git').exists():
         print('Pulling latest code...')
         print(run_cmd(['git', 'pull'], cwd=str(path))[1])
     else:
         print('No .git folder found, skipping git pull.')
-
     if req.exists() and (venv / 'bin/pip').exists():
         print('Installing requirements...')
         code, out, err = run_cmd([str(venv / 'bin/pip'), 'install', '-r', str(req)], cwd=str(path))
         print(out or err)
     else:
         print('No requirements.txt or venv pip found, skipping pip install.')
-
     if not args.no_restart:
         print('Restarting service...')
         code, out, err = run_cmd(['systemctl', 'restart', service])
@@ -350,7 +422,6 @@ def cmd_web(args):
         print('Set password with --password or FMANAGER_PASS env var.')
         sys.exit(1)
     token = 'Basic ' + base64.b64encode(f'{user}:{password}'.encode()).decode()
-
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.headers.get('Authorization') != token:
@@ -365,16 +436,17 @@ def cmd_web(args):
             self.send_header('Content-Length', str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f'Web dashboard: http://{args.host}:{args.port}  user={user}')
     server.serve_forever()
 
 
+CLOUDFLARE_SNIPPET = '''# Cloudflare real visitor IPs for Nginx\n# Update manually from Cloudflare docs if ranges change.\nreal_ip_header CF-Connecting-IP;\nset_real_ip_from 173.245.48.0/20;\nset_real_ip_from 103.21.244.0/22;\nset_real_ip_from 103.22.200.0/22;\nset_real_ip_from 103.31.4.0/22;\nset_real_ip_from 141.101.64.0/18;\nset_real_ip_from 108.162.192.0/18;\nset_real_ip_from 190.93.240.0/20;\nset_real_ip_from 188.114.96.0/20;\nset_real_ip_from 197.234.240.0/22;\nset_real_ip_from 198.41.128.0/17;\nset_real_ip_from 162.158.0.0/15;\nset_real_ip_from 104.16.0.0/13;\nset_real_ip_from 104.24.0.0/14;\nset_real_ip_from 172.64.0.0/13;\nset_real_ip_from 131.0.72.0/22;\nset_real_ip_from 2400:cb00::/32;\nset_real_ip_from 2606:4700::/32;\nset_real_ip_from 2803:f800::/32;\nset_real_ip_from 2405:b500::/32;\nset_real_ip_from 2405:8100::/32;\nset_real_ip_from 2a06:98c0::/29;\nset_real_ip_from 2c0f:f248::/32;\n'''
+
+
 def main():
     parser = argparse.ArgumentParser(prog='fmanager', description='Manage multiple Flask apps on one Ubuntu server')
     sub = parser.add_subparsers(dest='command')
-
     p = sub.add_parser('list', help='List configured apps'); p.set_defaults(func=cmd_list)
     p = sub.add_parser('status', help='Show app status'); p.add_argument('name', nargs='?'); p.set_defaults(func=cmd_status)
     p = sub.add_parser('top', help='Show CPU/RAM per configured app'); p.set_defaults(func=cmd_top)
@@ -385,14 +457,16 @@ def main():
     p = sub.add_parser('ports', help='Show configured app ports'); p.set_defaults(func=cmd_ports)
     p = sub.add_parser('info', help='Show app config'); p.add_argument('name'); p.set_defaults(func=cmd_info)
     p = sub.add_parser('add', help='Add app to config'); p.add_argument('name'); p.add_argument('--path', required=True); p.add_argument('--domain', required=True); p.add_argument('--port', required=True, type=int); p.add_argument('--module', default='app:app'); p.add_argument('--service'); p.add_argument('--user', default='www-data'); p.add_argument('--workers', type=int, default=3); p.add_argument('--venv'); p.add_argument('--env-file'); p.add_argument('--description'); p.set_defaults(func=cmd_add)
+    p = sub.add_parser('create', help='Create a new simple Flask app and add it'); p.add_argument('name'); p.add_argument('--domain', required=True); p.add_argument('--path'); p.add_argument('--port', type=int); p.add_argument('--service'); p.add_argument('--user', default='www-data'); p.add_argument('--workers', type=int, default=3); p.add_argument('--description'); p.add_argument('--force', action='store_true'); p.set_defaults(func=cmd_create)
     p = sub.add_parser('remove', help='Remove app from config only'); p.add_argument('name'); p.set_defaults(func=cmd_remove)
     p = sub.add_parser('gen-systemd', help='Generate systemd service'); p.add_argument('name'); p.add_argument('--force', action='store_true'); p.set_defaults(func=cmd_gen_systemd)
     p = sub.add_parser('gen-nginx', help='Generate Nginx config'); p.add_argument('name'); p.add_argument('--force', action='store_true'); p.set_defaults(func=cmd_gen_nginx)
+    p = sub.add_parser('ssl', help='Install Certbot SSL for app domain'); p.add_argument('name'); p.add_argument('--email'); p.add_argument('--redirect', action='store_true'); p.set_defaults(func=cmd_ssl)
+    p = sub.add_parser('cloudflare', help='Cloudflare helper commands'); p.add_argument('action', choices=['info', 'snippet', 'enable']); p.add_argument('name', nargs='?'); p.set_defaults(func=cmd_cloudflare)
     p = sub.add_parser('check', help='Check app files and port'); p.add_argument('name'); p.set_defaults(func=cmd_check)
     p = sub.add_parser('deploy', help='git pull, pip install, restart'); p.add_argument('name'); p.add_argument('--no-restart', action='store_true'); p.set_defaults(func=cmd_deploy)
     p = sub.add_parser('backup', help='Create tar.gz backup of app files'); p.add_argument('name'); p.set_defaults(func=cmd_backup)
     p = sub.add_parser('web', help='Run simple web dashboard'); p.add_argument('--host', default='127.0.0.1'); p.add_argument('--port', type=int, default=5050); p.add_argument('--user', default='admin'); p.add_argument('--password'); p.set_defaults(func=cmd_web)
-
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
