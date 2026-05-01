@@ -1,0 +1,12 @@
+apps:
+  app1:
+    path: /apps/app1
+    domain: app1.example.com
+    port: 8001
+    module: app:app
+    service: app1
+    user: www-data
+    workers: 3
+    venv: /apps/app1/venv
+    env_file: /apps/app1/.env
+    description: Main Flask app
